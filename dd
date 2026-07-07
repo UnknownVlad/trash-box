@@ -1,0 +1,144 @@
+/**
+     * Возвращает текущие committed offset группы для всех партиций,
+     * назначенных контейнеру с данным listenerId на этом поде.
+     *
+     * @param listenerId id контейнера (@KafkaListener id)
+     * @return Map: партиция -> committed offset (партиции без committed отсутствуют)
+     */
+    public Map<TopicPartition, Long> getCommittedOffsets(String listenerId) throws Exception {
+        MessageListenerContainer listenerContainer = findContainer(listenerId);
+        String groupId = listenerContainer.getGroupId();
+        Collection<TopicPartition> partitions = listenerContainer.getAssignedPartitions();
+
+        if (partitions == null || partitions.isEmpty()) {
+            log.warn("Контейнер с id {} не имеет назначенных партиций на этом поде, committed offset не получены",
+                    listenerId);
+            return Map.of();
+        }
+
+        Map<TopicPartition, OffsetAndMetadata> committed = adminClient
+                .listConsumerGroupOffsets(groupId,
+                        new ListConsumerGroupOffsetsOptions().topicPartitions(new ArrayList<>(partitions)))
+                .partitionsToOffsetAndMetadata()
+                .get(ADMIN_TIMEOUT_SEC, TimeUnit.SECONDS);
+
+        Map<TopicPartition, Long> result = new HashMap<>();
+        committed.forEach((tp, meta) -> {
+            if (meta != null) {
+                result.put(tp, meta.offset());
+            } else {
+                log.debug("Партиция {}: нет committed offset (null)", tp);
+            }
+        });
+        log.debug("Контейнер с id {}: получены committed offset для {} партиций", listenerId, result.size());
+        return result;
+    }
+
+
+
+    /**
+         * Возвращает offset, соответствующий таймштампу, для всех партиций,
+         * назначенных контейнеру с данным listenerId на этом поде.
+         * Через AdminClient.listOffsets(OffsetSpec.forTimestamp).
+         * Партиции, где после таймштампа сообщений нет (offset == -1), в результат
+         * не попадают.
+         *
+         * @param listenerId id контейнера
+         * @param timestamp  метка времени в мс
+         * @return Map: партиция -> offset для этого таймштампа
+         */
+        public Map<TopicPartition, Long> getOffsetsForTimestamp(String listenerId, long timestamp) throws Exception {
+            MessageListenerContainer listenerContainer = findContainer(listenerId);
+            Collection<TopicPartition> partitions = listenerContainer.getAssignedPartitions();
+
+            if (partitions == null || partitions.isEmpty()) {
+                log.warn("Контейнер с id {} не имеет назначенных партиций на этом поде, offset по timestamp не получены",
+                        listenerId);
+                return Map.of();
+            }
+
+            Map<TopicPartition, OffsetSpec> query = partitions.stream()
+                    .collect(Collectors.toMap(tp -> tp, tp -> OffsetSpec.forTimestamp(timestamp)));
+
+            Map<TopicPartition, ListOffsetsResult.ListOffsetsResultInfo> found =
+                    adminClient.listOffsets(query).all().get(ADMIN_TIMEOUT_SEC, TimeUnit.SECONDS);
+
+            Map<TopicPartition, Long> result = new HashMap<>();
+            found.forEach((tp, info) -> {
+                if (info.offset() != -1) {
+                    result.put(tp, info.offset());
+                } else {
+                    log.debug("Партиция {}: нет сообщений после timestamp {}, offset не определён", tp, timestamp);
+                }
+            });
+            log.debug("Контейнер с id {}: получены offset по timestamp {} для {} партиций",
+                    listenerId, timestamp, result.size());
+            return result;
+        }
+
+
+        /**
+             * Для списка таймштампов собирает по каждой партиции список offset-кандидатов.
+             *
+             * @param listenerId id контейнера
+             * @param timestamps список меток времени
+             * @return Map: партиция -> список offset (по одному на каждый подходящий таймштамп)
+             */
+            private Map<TopicPartition, List<Long>> collectCandidateOffsets(String listenerId, List<Long> timestamps)
+                    throws Exception {
+
+                Map<TopicPartition, List<Long>> candidatesByPartition = new HashMap<>();
+                for (Long ts : timestamps) {
+                    Map<TopicPartition, Long> perTs = getOffsetsForTimestamp(listenerId, ts);
+                    perTs.forEach((tp, offset) ->
+                            candidatesByPartition.computeIfAbsent(tp, k -> new ArrayList<>()).add(offset));
+                }
+                return candidatesByPartition;
+            }
+
+            public Map<TopicPartition, Long> calculateTargetOffsets(String containerId, List<Long> timestamps) {
+                    Map<TopicPartition, Long> result = new HashMap<>();
+                    withLock(containerId, "расчёт целевого offset", () -> {
+                        if (timestamps == null || timestamps.isEmpty()) {
+                            log.warn("Список таймштампов пуст для контейнера с id {}, целевые offset не рассчитаны", containerId);
+                            return;
+                        }
+
+                        MessageListenerContainer listenerContainer = findContainer(containerId);
+                        if (listenerContainer.getAssignedPartitions() == null
+                                || listenerContainer.getAssignedPartitions().isEmpty()) {
+                            log.warn("Контейнер с id {} не имеет назначенных партиций на этом поде, расчёт пропущен", containerId);
+                            return;
+                        }
+
+                        // пауза ДО чтения committed — фиксируем позицию, контейнер остаётся на паузе
+                        pauseContainerInternal(containerId);
+
+                        try {
+                            Map<TopicPartition, Long> committed = getCommittedOffsets(containerId);
+                            Map<TopicPartition, List<Long>> candidates = collectCandidateOffsets(containerId, timestamps);
+
+                            candidates.forEach((tp, offsets) -> {
+                                Long committedOffset = committed.get(tp);
+                                if (committedOffset == null) {
+                                    log.debug("Партиция {}: нет committed offset, пропускаем", tp);
+                                    return;
+                                }
+                                Long chosen = chooseNearestBackwardOffset(offsets, committedOffset);
+                                if (chosen == null) {
+                                    log.info("Партиция {}: подходящего offset нет (committed {}, кандидатов {}), пропущена",
+                                            tp, committedOffset, offsets.size());
+                                } else {
+                                    result.put(tp, chosen);
+                                    log.info("Партиция {}: выбран целевой offset {} (committed {}, кандидатов {})",
+                                            tp, chosen, committedOffset, offsets.size());
+                                }
+                            });
+                        } catch (Exception e) {
+                            log.error("Ошибка расчёта целевого offset для контейнера с id {}", containerId, e);
+                            throw new IllegalStateException(
+                                    String.format("Ошибка расчёта целевого offset для контейнера с id %s", containerId), e);
+                        }
+                    });
+                    return result;
+                }
