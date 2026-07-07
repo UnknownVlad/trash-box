@@ -1,0 +1,482 @@
+package ru.sbrf.pprb.compliance.circollector.components;
+
+import lombok.extern.slf4j.Slf4j;
+import org.apache.kafka.clients.admin.AdminClient;
+import org.apache.kafka.clients.admin.ListOffsetsResult;
+import org.apache.kafka.clients.admin.OffsetSpec;
+import org.apache.kafka.clients.consumer.OffsetAndMetadata;
+import org.apache.kafka.common.TopicPartition;
+import org.springframework.beans.factory.annotation.Qualifier;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.context.event.EventListener;
+import org.springframework.kafka.config.KafkaListenerEndpointRegistry;
+import org.springframework.kafka.event.ConsumerPausedEvent;
+import org.springframework.kafka.event.ConsumerResumedEvent;
+import org.springframework.kafka.listener.MessageListenerContainer;
+import org.springframework.stereotype.Component;
+import org.springframework.util.CollectionUtils;
+import ru.sbrf.pprb.compliance.kafka_message_mapper.pojo.AbstractResetOffsetConsumerSeekAware;
+
+import java.util.ArrayList;
+import java.util.Collection;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.Objects;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.Semaphore;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.locks.ReentrantLock;
+import java.util.stream.Collectors;
+
+@Slf4j
+@Component
+public class KafkaContainerAdministratorImpl {
+
+    private static final long LOCK_TIMEOUT_SEC = 30;
+    private static final long ADMIN_TIMEOUT_SEC = 10;
+
+    private final KafkaListenerEndpointRegistry kafkaListenerEndpointRegistry;
+    private final Map<String, AbstractResetOffsetConsumerSeekAware> idToResetOffsetConsumerAware;
+    private final AdminClient adminClient;
+    private final Integer waitPauseTime;
+
+    /** Лок по containerId — сериализует pause/resume/stop/start/reset одного контейнера. */
+    private final Map<String, ReentrantLock> locks = new ConcurrentHashMap<>();
+
+    /** Семафор паузы per-containerId. */
+    private final Map<String, Semaphore> pauseSemaphores = new ConcurrentHashMap<>();
+
+    /** Семафор возобновления per-containerId. */
+    private final Map<String, Semaphore> resumeSemaphores = new ConcurrentHashMap<>();
+
+    public KafkaContainerAdministratorImpl(
+            KafkaListenerEndpointRegistry kafkaListenerEndpointRegistry,
+            @Qualifier("idToResetOffsetConsumerAware")
+            Map<String, AbstractResetOffsetConsumerSeekAware> idToResetOffsetConsumerAware,
+            AdminClient adminClient,
+            @Value("${application.reconciliation.wait-time-to-pause-in-sec}") Integer waitPauseTime) {
+        this.kafkaListenerEndpointRegistry = kafkaListenerEndpointRegistry;
+        this.idToResetOffsetConsumerAware = idToResetOffsetConsumerAware;
+        this.adminClient = adminClient;
+        this.waitPauseTime = waitPauseTime;
+        log.info("KafkaContainerAdministratorImpl инициализирован: зарегистрировано {} ConsumerSeekAware, таймаут ожидания паузы {} сек, таймаут блокировки {} сек",
+                idToResetOffsetConsumerAware.size(), waitPauseTime, LOCK_TIMEOUT_SEC);
+        if (log.isDebugEnabled()) {
+            log.debug("Зарегистрированные ключи ConsumerSeekAware: {}", idToResetOffsetConsumerAware.keySet());
+        }
+    }
+
+    private ReentrantLock lockFor(String containerId) {
+        return locks.computeIfAbsent(containerId, k -> {
+            log.debug("Создан новый лок для контейнера с id {}", containerId);
+            return new ReentrantLock();
+        });
+    }
+
+    private Semaphore pauseSemaphoreFor(String containerId) {
+        return pauseSemaphores.computeIfAbsent(containerId, k -> {
+            log.debug("Создан новый семафор паузы для контейнера с id {}", containerId);
+            return new Semaphore(0);
+        });
+    }
+
+    private Semaphore resumeSemaphoreFor(String containerId) {
+        return resumeSemaphores.computeIfAbsent(containerId, k -> {
+            log.debug("Создан новый семафор возобновления для контейнера с id {}", containerId);
+            return new Semaphore(0);
+        });
+    }
+
+    // -----------------------------------------------------------------
+    // PUBLIC API — управление контейнером
+    // -----------------------------------------------------------------
+
+    public void pauseContainer(String containerId) {
+        withLock(containerId, "постановка на паузу", () -> {
+            log.info("Постановка на паузу контейнера с id {}", containerId);
+            MessageListenerContainer listenerContainer = findContainer(containerId);
+            doPauseAndAwait(containerId, listenerContainer);
+            log.info("Контейнер с id {} успешно поставлен на паузу", containerId);
+        });
+    }
+
+    public void resumeContainer(String containerId) {
+        withLock(containerId, "возобновление", () -> {
+            log.info("Возобновление контейнера с id {}", containerId);
+            MessageListenerContainer listenerContainer = findContainer(containerId);
+            doResumeAndAwait(containerId, listenerContainer);
+            log.info("Контейнер с id {} успешно возобновлён", containerId);
+        });
+    }
+
+    public void stopContainer(String containerId) {
+        withLock(containerId, "остановка", () -> {
+            log.info("Остановка контейнера с id {}", containerId);
+            MessageListenerContainer listenerContainer = findContainer(containerId);
+            if (listenerContainer.isRunning()) {
+                log.debug("Отправка команды stop контейнеру с id {}", containerId);
+                listenerContainer.stop();
+                log.info("Контейнер с id {} остановлен", containerId);
+            } else {
+                log.info("Контейнер с id {} уже остановлен, действие не требуется", containerId);
+            }
+        });
+    }
+
+    public void startContainer(String containerId) {
+        withLock(containerId, "запуск", () -> {
+            log.info("Запуск контейнера с id {}", containerId);
+            MessageListenerContainer listenerContainer = findContainer(containerId);
+            if (!listenerContainer.isRunning()) {
+                log.debug("Отправка команды start контейнеру с id {}", containerId);
+                listenerContainer.start();
+                log.info("Контейнер с id {} запущен", containerId);
+            } else {
+                log.info("Контейнер с id {} уже запущен, действие не требуется", containerId);
+            }
+        });
+    }
+
+    /**
+     * Сброс offset на timestamp: пауза (с ожиданием) -> seek -> возобновление (с ожиданием).
+     * Возобновление гарантировано в finally даже при ошибке seek.
+     */
+    public void resetOffsetToTimestamp(String containerId, long timestamp) {
+        withLock(containerId, "сброс offset", () -> {
+            log.info("Начало сброса offset контейнера с id {} на timestamp {}", containerId, timestamp);
+            MessageListenerContainer listenerContainer = findContainer(containerId);
+            AbstractResetOffsetConsumerSeekAware consumerSeekAware = findSeekAware(containerId);
+
+            doPauseAndAwait(containerId, listenerContainer);
+            try {
+                log.debug("Выполнение seekToTimestamp для контейнера с id {} на timestamp {}", containerId, timestamp);
+                consumerSeekAware.seekToTimestamp(timestamp);
+                log.info("Offset контейнера с id {} успешно сброшен на timestamp {}", containerId, timestamp);
+            } catch (Exception e) {
+                log.error("Ошибка сброса offset для контейнера с id {} на timestamp {}", containerId, timestamp, e);
+                throw new IllegalStateException(
+                        String.format("Ошибка сброса offset для контейнера с id %s на timestamp %d", containerId, timestamp), e);
+            } finally {
+                log.debug("Возобновление контейнера с id {} после сброса offset", containerId);
+                doResumeAndAwait(containerId, listenerContainer);
+            }
+        });
+    }
+
+    // -----------------------------------------------------------------
+    // Внутренние pause/resume с ожиданием подтверждения через семафор
+    // -----------------------------------------------------------------
+
+    private void doPauseAndAwait(String containerId, MessageListenerContainer listenerContainer)
+            throws InterruptedException {
+
+        if (!listenerContainer.isRunning()) {
+            log.error("Контейнер с id {} не запущен, пауза невозможна", containerId);
+            throw new IllegalStateException(
+                    String.format("Контейнер с id %s не запущен, пауза невозможна", containerId));
+        }
+        if (listenerContainer.isContainerPaused()) {
+            log.info("Контейнер с id {} уже на паузе, повторная постановка не требуется", containerId);
+            return;
+        }
+
+        Semaphore semaphore = pauseSemaphoreFor(containerId);
+        int drained = semaphore.drainPermits();
+        if (drained > 0) {
+            log.debug("Контейнер с id {}: сброшено {} накопленных разрешений семафора паузы перед операцией", containerId, drained);
+        }
+
+        int amountOfPartitions = amountOfPartitions(listenerContainer);
+        log.debug("Контейнер с id {}: отправка команды pause, ожидание {} подтверждений (по числу партиций) до {} сек",
+                containerId, amountOfPartitions, waitPauseTime);
+
+        listenerContainer.getContainerProperties().setPauseImmediate(true);
+        listenerContainer.pause();
+
+        boolean acquired = semaphore.tryAcquire(amountOfPartitions, waitPauseTime, TimeUnit.SECONDS);
+        if (!acquired) {
+            log.error("Контейнер с id {} не подтвердил паузу за {} сек (ожидалось {} партиций)",
+                    containerId, waitPauseTime, amountOfPartitions);
+            throw new IllegalStateException(
+                    String.format("Контейнер с id %s не подтвердил паузу за %d сек", containerId, waitPauseTime));
+        }
+        log.debug("Контейнер с id {}: пауза подтверждена для {} партиций", containerId, amountOfPartitions);
+    }
+
+    private void doResumeAndAwait(String containerId, MessageListenerContainer listenerContainer)
+            throws InterruptedException {
+
+        if (!listenerContainer.isContainerPaused()) {
+            log.info("Контейнер с id {} не на паузе, возобновление не требуется", containerId);
+            return;
+        }
+
+        Semaphore semaphore = resumeSemaphoreFor(containerId);
+        int drained = semaphore.drainPermits();
+        if (drained > 0) {
+            log.debug("Контейнер с id {}: сброшено {} накопленных разрешений семафора возобновления перед операцией", containerId, drained);
+        }
+
+        int amountOfPartitions = amountOfPartitions(listenerContainer);
+        log.debug("Контейнер с id {}: отправка команды resume, ожидание {} подтверждений (по числу партиций) до {} сек",
+                containerId, amountOfPartitions, waitPauseTime);
+
+        listenerContainer.resume();
+
+        boolean acquired = semaphore.tryAcquire(amountOfPartitions, waitPauseTime, TimeUnit.SECONDS);
+        if (!acquired) {
+            log.error("Контейнер с id {} не подтвердил возобновление за {} сек (ожидалось {} партиций)",
+                    containerId, waitPauseTime, amountOfPartitions);
+            throw new IllegalStateException(
+                    String.format("Контейнер с id %s не подтвердил возобновление за %d сек", containerId, waitPauseTime));
+        }
+        log.debug("Контейнер с id {}: возобновление подтверждено для {} партиций", containerId, amountOfPartitions);
+    }
+
+    private int amountOfPartitions(MessageListenerContainer listenerContainer) {
+        Collection<TopicPartition> assigned = listenerContainer.getAssignedPartitions();
+        if (CollectionUtils.isEmpty(assigned)) {
+            log.debug("У контейнера нет назначенных партиций, используется значение по умолчанию 1");
+            return 1;
+        }
+        return assigned.size();
+    }
+
+    // -----------------------------------------------------------------
+    // Обработчики событий — с фильтрацией по containerId и по числу партиций
+    // -----------------------------------------------------------------
+
+    @EventListener
+    public void onPaused(ConsumerPausedEvent event) {
+        String containerId = resolveId(event.getSource());
+        if (containerId == null) {
+            log.debug("Получено событие ConsumerPausedEvent без идентификатора контейнера, пропускаем");
+            return;
+        }
+        Semaphore semaphore = pauseSemaphores.get(containerId);
+        if (semaphore == null) {
+            log.debug("Получено событие ConsumerPausedEvent для контейнера с id {}, но операция паузы не ожидается, пропускаем", containerId);
+            return;
+        }
+        Collection<TopicPartition> partitions = event.getPartitions();
+        int count = CollectionUtils.isEmpty(partitions) ? 1 : partitions.size();
+        semaphore.release(count);
+        log.debug("Обработано событие ConsumerPausedEvent для контейнера с id {}: освобождено {} разрешений, доступно теперь {}",
+                containerId, count, semaphore.availablePermits());
+    }
+
+    @EventListener
+    public void onResumed(ConsumerResumedEvent event) {
+        String containerId = resolveId(event.getSource());
+        if (containerId == null) {
+            log.debug("Получено событие ConsumerResumedEvent без идентификатора контейнера, пропускаем");
+            return;
+        }
+        Semaphore semaphore = resumeSemaphores.get(containerId);
+        if (semaphore == null) {
+            log.debug("Получено событие ConsumerResumedEvent для контейнера с id {}, но операция возобновления не ожидается, пропускаем", containerId);
+            return;
+        }
+        Collection<TopicPartition> partitions = event.getPartitions();
+        int count = CollectionUtils.isEmpty(partitions) ? 1 : partitions.size();
+        semaphore.release(count);
+        log.debug("Обработано событие ConsumerResumedEvent для контейнера с id {}: освобождено {} разрешений, доступно теперь {}",
+                containerId, count, semaphore.availablePermits());
+    }
+
+    private String resolveId(Object source) {
+        if (source instanceof MessageListenerContainer container) {
+            return container.getListenerId();
+        }
+        return null;
+    }
+
+    // -----------------------------------------------------------------
+    // Работа с offset: committed, по timestamp, выбор ближайшего, расчёт целевых
+    // -----------------------------------------------------------------
+
+    /**
+     * Текущие committed offset группы для всех партиций контейнера с данным containerId.
+     */
+    public Map<TopicPartition, Long> getCommittedOffsets(String containerId) throws Exception {
+        MessageListenerContainer listenerContainer = findContainer(containerId);
+        String groupId = listenerContainer.getGroupId();
+        log.debug("Получение committed offset для контейнера с id {}, группа {}", containerId, groupId);
+
+        Map<TopicPartition, OffsetAndMetadata> committed = adminClient
+                .listConsumerGroupOffsets(groupId)
+                .partitionsToOffsetAndMetadata()
+                .get(ADMIN_TIMEOUT_SEC, TimeUnit.SECONDS);
+
+        Map<TopicPartition, Long> result = new HashMap<>();
+        committed.forEach((tp, meta) -> {
+            if (meta != null) {
+                result.put(tp, meta.offset());
+            } else {
+                log.debug("Партиция {}: committed offset отсутствует (null)", tp);
+            }
+        });
+        log.debug("Контейнер с id {}: получены committed offset для {} партиций", containerId, result.size());
+        return result;
+    }
+
+    /**
+     * Offset, соответствующий timestamp, для всех партиций контейнера с данным containerId.
+     * Партиции без сообщений после timestamp (offset == -1) в результат не попадают.
+     */
+    public Map<TopicPartition, Long> getOffsetsForTimestamp(String containerId, long timestamp) throws Exception {
+        MessageListenerContainer listenerContainer = findContainer(containerId);
+        Collection<TopicPartition> partitions = listenerContainer.getAssignedPartitions();
+
+        if (CollectionUtils.isEmpty(partitions)) {
+            log.warn("Контейнер с id {} не имеет назначенных партиций, offset по timestamp {} не получены",
+                    containerId, timestamp);
+            return Map.of();
+        }
+        log.debug("Получение offset по timestamp {} для контейнера с id {} ({} партиций)",
+                timestamp, containerId, partitions.size());
+
+        Map<TopicPartition, OffsetSpec> query = partitions.stream()
+                .collect(Collectors.toMap(tp -> tp, tp -> OffsetSpec.forTimestamp(timestamp)));
+
+        Map<TopicPartition, ListOffsetsResult.ListOffsetsResultInfo> found =
+                adminClient.listOffsets(query).all().get(ADMIN_TIMEOUT_SEC, TimeUnit.SECONDS);
+
+        Map<TopicPartition, Long> result = new HashMap<>();
+        found.forEach((tp, info) -> {
+            if (info.offset() != -1) {
+                result.put(tp, info.offset());
+            } else {
+                log.debug("Партиция {}: нет сообщений после timestamp {}, offset не определён", tp, timestamp);
+            }
+        });
+        log.debug("Контейнер с id {}: получены offset по timestamp {} для {} партиций",
+                containerId, timestamp, result.size());
+        return result;
+    }
+
+    /**
+     * Из списка offset-кандидатов выбирает максимальный, НЕ превышающий committed
+     * (ближайший меньший или равный). Возвращает null, если подходящего нет
+     * или выбранный равен committed (двигать некуда).
+     */
+    private Long chooseNearestBackwardOffset(List<Long> candidates, long committedOffset) {
+        Long chosen = candidates.stream()
+                .filter(offset -> offset <= committedOffset)
+                .max(Long::compareTo)
+                .orElse(null);
+
+        if (chosen == null || chosen == committedOffset) {
+            return null;
+        }
+        return chosen;
+    }
+
+    /**
+     * Считает целевой offset по списку таймштампов: для каждой партиции —
+     * ближайший меньший или равный committed (самая поздняя точка отката,
+     * не уводящая вперёд). Только читает метаданные, ничего не двигает.
+     */
+    public Map<TopicPartition, Long> calculateTargetOffsets(String containerId, List<Long> timestamps) throws Exception {
+        if (CollectionUtils.isEmpty(timestamps)) {
+            log.warn("Список таймштампов пуст для контейнера с id {}, целевые offset не рассчитаны", containerId);
+            return Map.of();
+        }
+        log.debug("Расчёт целевого offset для контейнера с id {} по {} таймштампам", containerId, timestamps.size());
+
+        Map<TopicPartition, Long> committed = getCommittedOffsets(containerId);
+
+        Map<TopicPartition, List<Long>> candidatesByPartition = new HashMap<>();
+        for (Long timestamp : timestamps) {
+            Map<TopicPartition, Long> perTs = getOffsetsForTimestamp(containerId, timestamp);
+            perTs.forEach((tp, offset) ->
+                    candidatesByPartition.computeIfAbsent(tp, k -> new ArrayList<>()).add(offset));
+        }
+
+        Map<TopicPartition, Long> result = new HashMap<>();
+        candidatesByPartition.forEach((tp, candidates) -> {
+            Long committedOffset = committed.get(tp);
+            if (committedOffset == null) {
+                log.debug("Партиция {}: нет committed offset, пропускаем", tp);
+                return;
+            }
+            Long chosen = chooseNearestBackwardOffset(candidates, committedOffset);
+            if (chosen == null) {
+                log.info("Партиция {}: подходящего offset нет (committed {}, кандидатов {}), пропущена",
+                        tp, committedOffset, candidates.size());
+            } else {
+                result.put(tp, chosen);
+                log.info("Партиция {}: выбран целевой offset {} (committed {}, кандидатов {})",
+                        tp, chosen, committedOffset, candidates.size());
+            }
+        });
+        return result;
+    }
+
+    // -----------------------------------------------------------------
+    // Враппер лока: захват с таймаутом + гарантированный unlock
+    // -----------------------------------------------------------------
+
+    private void withLock(String containerId, String operationName, LockedAction action) {
+        ReentrantLock lock = lockFor(containerId);
+        boolean acquired;
+        try {
+            log.debug("Попытка захвата лока для операции '{}' контейнера с id {} (таймаут {} сек)",
+                    operationName, containerId, LOCK_TIMEOUT_SEC);
+            acquired = lock.tryLock(LOCK_TIMEOUT_SEC, TimeUnit.SECONDS);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            log.error("Прервано ожидание блокировки для операции '{}' контейнера с id {}", operationName, containerId, e);
+            throw new IllegalStateException(
+                    String.format("Прервано ожидание блокировки для контейнера с id %s", containerId), e);
+        }
+        if (!acquired) {
+            log.error("Не удалось получить блокировку для операции '{}' контейнера с id {} за {} сек, вероятно выполняется другая операция",
+                    operationName, containerId, LOCK_TIMEOUT_SEC);
+            throw new IllegalStateException(
+                    String.format("Не удалось получить блокировку для контейнера с id %s за %d сек, вероятно выполняется другая операция", containerId, LOCK_TIMEOUT_SEC));
+        }
+        try {
+            action.run();
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            log.error("Операция '{}' контейнера с id {} прервана", operationName, containerId, e);
+            throw new IllegalStateException(
+                    String.format("Операция для контейнера с id %s прервана", containerId), e);
+        } finally {
+            lock.unlock();
+            log.debug("Лок освобождён после операции '{}' контейнера с id {}", operationName, containerId);
+        }
+    }
+
+    @FunctionalInterface
+    private interface LockedAction {
+        void run() throws InterruptedException;
+    }
+
+    // -----------------------------------------------------------------
+    // Поиск контейнера и seek-aware
+    // -----------------------------------------------------------------
+
+    private MessageListenerContainer findContainer(String containerId) {
+        MessageListenerContainer listenerContainer = kafkaListenerEndpointRegistry.getListenerContainer(containerId);
+        if (Objects.isNull(listenerContainer)) {
+            log.error("Контейнер с id {} не найден в реестре", containerId);
+            throw new KafkaMessageMapperNotFoundException(
+                    String.format("Контейнер с id %s не найден", containerId));
+        }
+        return listenerContainer;
+    }
+
+    private AbstractResetOffsetConsumerSeekAware findSeekAware(String containerId) {
+        AbstractResetOffsetConsumerSeekAware consumerSeekAware = idToResetOffsetConsumerAware.get(containerId);
+        if (Objects.isNull(consumerSeekAware)) {
+            log.error("Для контейнера с id {} не зарегистрирован ConsumerSeekAware. Доступные ключи: {}",
+                    containerId, idToResetOffsetConsumerAware.keySet());
+            throw new KafkaMessageMapperNotFoundException(
+                    String.format("Для контейнера с id %s не зарегистрирован ConsumerSeekAware (проверьте, что ключ совпадает с id контейнера)", containerId));
+        }
+        return consumerSeekAware;
+    }
+}
