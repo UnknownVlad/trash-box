@@ -1,0 +1,79 @@
+/**
+     * Сброс offset контейнера на явно заданные значения (партиция -> offset).
+     * Пауза (с ожиданием) -> проверка совпадения партиций -> seek -> возобновление.
+     *
+     * Перед seek строго сверяет, что множество партиций в targetOffsets ТОЧНО
+     * совпадает с назначенными контейнеру на этом поде: ни лишних, ни
+     * недостающих. Несовпадение обычно означает, что между расчётом и
+     * применением произошёл ребаланс, либо мапа сформирована для другого
+     * состояния/контейнера — в этом случае бросается ошибка ДО любого seek,
+     * чтобы не сместить offset частично или не по тем партициям.
+     *
+     * @param containerId   id контейнера
+     * @param targetOffsets партиция -> целевой offset
+     */
+    public void resetOffsetToPartitions(String containerId, Map<TopicPartition, Long> targetOffsets) {
+        withLock(containerId, "сброс offset по партициям", () -> {
+            log.info("Начало сброса offset контейнера с id {} по заданным партициям: {} шт.",
+                    containerId, targetOffsets == null ? 0 : targetOffsets.size());
+
+            if (CollectionUtils.isEmpty(targetOffsets)) {
+                log.warn("Пустая мапа offset для контейнера с id {}, сброс не выполняется", containerId);
+                return;
+            }
+
+            MessageListenerContainer listenerContainer = findContainer(containerId);
+            AbstractResetOffsetConsumerSeekAware consumerSeekAware = findSeekAware(containerId);
+
+            doPauseAndAwait(containerId, listenerContainer);
+            try {
+                // строгая сверка партиций уже ПОД паузой (состояние стабильно)
+                validatePartitionsMatch(containerId, listenerContainer, targetOffsets.keySet());
+
+                targetOffsets.forEach((tp, offset) -> {
+                    log.debug("Контейнер с id {}: seek партиции {} на offset {}", containerId, tp, offset);
+                    consumerSeekAware.seekToOffset(tp.topic(), tp.partition(), offset);
+                });
+                log.info("Offset контейнера с id {} успешно сброшен для {} партиций", containerId, targetOffsets.size());
+            } catch (Exception e) {
+                log.error("Ошибка сброса offset по партициям для контейнера с id {}", containerId, e);
+                throw new IllegalStateException(
+                        String.format("Ошибка сброса offset по партициям для контейнера с id %s", containerId), e);
+            } finally {
+                log.debug("Возобновление контейнера с id {} после сброса offset по партициям", containerId);
+                doResumeAndAwait(containerId, listenerContainer);
+            }
+        });
+    }
+
+    /**
+     * Проверяет, что множество переданных партиций ТОЧНО совпадает с назначенными
+     * контейнеру. Бросает IllegalStateException при любом расхождении: несовпадении
+     * количества, наличии лишних или отсутствии ожидаемых партиций.
+     */
+    private void validatePartitionsMatch(String containerId, MessageListenerContainer listenerContainer,
+                                         Set<TopicPartition> requested) {
+        Collection<TopicPartition> assignedCollection = listenerContainer.getAssignedPartitions();
+        if (CollectionUtils.isEmpty(assignedCollection)) {
+            log.error("Контейнер с id {} не имеет назначенных партиций, а передано {} партиций для сброса",
+                    containerId, requested.size());
+            throw new IllegalStateException(
+                    String.format("Контейнер с id %s не имеет назначенных партиций, сброс невозможен", containerId));
+        }
+
+        Set<TopicPartition> assigned = new HashSet<>(assignedCollection);
+
+        if (assigned.size() != requested.size() || !assigned.equals(requested)) {
+            Set<TopicPartition> missing = new HashSet<>(assigned);   // назначены, но нет в мапе
+            missing.removeAll(requested);
+            Set<TopicPartition> extra = new HashSet<>(requested);    // в мапе, но не назначены контейнеру
+            extra.removeAll(assigned);
+
+            log.error("Контейнер с id {}: несовпадение партиций. Назначено {}, передано {}. Отсутствуют в мапе: {}. Лишние в мапе: {}",
+                    containerId, assigned.size(), requested.size(), missing, extra);
+            throw new IllegalStateException(
+                    String.format("Контейнер с id %s: переданные партиции не совпадают с назначенными (назначено %d, передано %d, отсутствуют в мапе %s, лишние в мапе %s)",
+                            containerId, assigned.size(), requested.size(), missing, extra));
+        }
+        log.debug("Контейнер с id {}: партиции совпадают ({} шт.), проверка пройдена", containerId, assigned.size());
+    }
