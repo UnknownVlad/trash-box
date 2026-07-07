@@ -1,0 +1,33 @@
+ public void resetOffsets(String containerId, List<Long> timestamps) throws Exception {
+        log.info("Запуск сброса offset для контейнера с id {} по {} таймштампам",
+                containerId, timestamps == null ? 0 : timestamps.size());
+
+        boolean paused = false;
+        try {
+            // ШАГ 1: пауза (бросит исключение, если не подтвердилась)
+            kafkaAdmin.pauseContainer(containerId);
+            paused = true;
+
+            // ШАГ 2: расчёт целевых offset под паузой
+            Map<TopicPartition, Long> targets = kafkaAdmin.calculateTargetOffsets(containerId, timestamps);
+
+            if (targets.isEmpty()) {
+                log.info("Для контейнера с id {} нет партиций для сброса, seek не требуется", containerId);
+                return; // не ошибка — просто нечего двигать; finally снимет паузу
+            }
+            log.info("Контейнер с id {}: рассчитаны целевые offset для {} партиций: {}",
+                    containerId, targets.size(), targets);
+
+            // ШАГ 3: seek без паузы (уже под паузой; бросит при несовпадении партиций)
+            kafkaAdmin.seekToPartitionsWithoutPause(containerId, targets);
+
+            log.info("Сброс offset для контейнера с id {} завершён успешно", containerId);
+
+        } finally {
+            // ШАГ 4: возобновление — обязательно, но только если паузу реально ставили
+            if (paused) {
+                kafkaAdmin.resumeContainer(containerId);
+                log.debug("Контейнер с id {} возобновлён после сброса offset", containerId);
+            }
+        }
+    }
