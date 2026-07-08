@@ -683,3 +683,42 @@ public class KafkaContainerAdministratorImpl implements KafkaContainerAdministra
             return consumerSeekAware;
         }
     }
+
+
+    @EventListener
+    public void onPaused(ConsumerPausedEvent event) {
+        String containerId = resolveParentContainerId(event.getSource());
+        if (containerId == null) {
+            log.debug("ConsumerPausedEvent: не удалось определить родительский контейнер, пропускаем");
+            return;
+        }
+        Semaphore semaphore = pauseSemaphores.get(containerId);
+        if (semaphore == null) {
+            log.debug("ConsumerPausedEvent для контейнера с id {}, но операция паузы не ожидается, пропускаем", containerId);
+            return;
+        }
+        Collection<TopicPartition> partitions = event.getPartitions();
+        int count = CollectionUtils.isEmpty(partitions) ? 1 : partitions.size();
+        semaphore.release(count);
+        log.debug("Обработано ConsumerPausedEvent для контейнера с id {}: освобождено {} разрешений, доступно теперь {}",
+                containerId, count, semaphore.availablePermits());
+    }
+
+    @EventListener
+    public void onResumed(ConsumerResumedEvent event) {
+        String containerId = resolveParentContainerId(event.getSource());
+        if (containerId == null) {
+            log.debug("ConsumerResumedEvent: не удалось определить родительский контейнер, пропускаем");
+            return;
+        }
+        Semaphore semaphore = resumeSemaphores.get(containerId);
+        if (semaphore == null) {
+            log.debug("ConsumerResumedEvent для контейнера с id {}, но операция возобновления не ожидается, пропускаем", containerId);
+            return;
+        }
+        Collection<TopicPartition> partitions = event.getPartitions();
+        int count = CollectionUtils.isEmpty(partitions) ? 1 : partitions.size();
+        semaphore.release(count);
+        log.debug("Обработано ConsumerResumedEvent для контейнера с id {}: освобождено {} разрешений, доступно теперь {}",
+                containerId, count, semaphore.availablePermits());
+    }

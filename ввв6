@@ -1,0 +1,28 @@
+/**
+ * Возвращает РОДИТЕЛЬСКИЙ containerId (исходный, под которым лежит семафор)
+ * для контейнера-источника события. Работает надёжно даже когда id одного
+ * контейнера является префиксом другого, потому что матчит по фактической
+ * принадлежности дочернего контейнера родителю, а не по строке id.
+ */
+private String resolveParentContainerId(Object source) {
+    if (!(source instanceof MessageListenerContainer eventContainer)) {
+        return null;
+    }
+
+    // проходим по всем зарегистрированным РОДИТЕЛЬСКИМ контейнерам
+    for (MessageListenerContainer parent : kafkaListenerEndpointRegistry.getListenerContainers()) {
+        // 1) источник и есть сам родитель (concurrency = 1, событие от него же)
+        if (parent == eventContainer) {
+            return parent.getListenerId();
+        }
+        // 2) источник — дочерний контейнер этого родителя
+        if (parent instanceof ConcurrentMessageListenerContainer<?, ?> concurrent) {
+            List<?> children = concurrent.getContainers();
+            if (children != null && children.contains(eventContainer)) {
+                return parent.getListenerId();
+            }
+        }
+    }
+    log.debug("Не удалось сопоставить источник события с родительским контейнером");
+    return null;
+}
