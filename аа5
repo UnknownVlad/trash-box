@@ -1,0 +1,441 @@
+package ru.sbrf.pprb.compliance.circollector.services.kafka.administrator.manager;
+
+import lombok.extern.slf4j.Slf4j;
+import org.apache.kafka.clients.admin.AdminClient;
+import org.apache.kafka.clients.admin.ConsumerGroupDescription;
+import org.apache.kafka.clients.admin.ListOffsetsResult;
+import org.apache.kafka.clients.admin.OffsetSpec;
+import org.apache.kafka.clients.consumer.OffsetAndMetadata;
+import org.apache.kafka.common.ConsumerGroupState;
+import org.apache.kafka.common.TopicPartition;
+import org.jetbrains.annotations.NotNull;
+import org.springframework.beans.factory.annotation.Qualifier;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.context.event.EventListener;
+import org.springframework.kafka.config.KafkaListenerEndpointRegistry;
+import org.springframework.kafka.event.ConsumerPausedEvent;
+import org.springframework.kafka.event.ConsumerResumedEvent;
+import org.springframework.kafka.listener.MessageListenerContainer;
+import org.springframework.stereotype.Component;
+import org.springframework.util.CollectionUtils;
+import ru.sbrf.pprb.compliance.kafka_message_mapper.exceptions.KafkaMessageMapperNotFoundException;
+import ru.sbrf.pprb.compliance.kafka_message_mapper.pojo.AbstractResetOffsetConsumerSeekAware;
+
+import java.util.ArrayList;
+import java.util.Collection;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.List;
+import java.util.Map;
+import java.util.Objects;
+import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.Semaphore;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.locks.ReentrantLock;
+import java.util.stream.Collectors;
+
+@Slf4j
+@Component
+public class KafkaContainerAdministratorImpl implements KafkaContainerAdministrator {
+
+    private static final long LOCK_TIMEOUT_SEC = 30;
+    private static final long ADMIN_TIMEOUT_SEC = 20;
+
+    private final KafkaListenerEndpointRegistry kafkaListenerEndpointRegistry;
+    private final Map<String, AbstractResetOffsetConsumerSeekAware> idToResetOffsetConsumerAware;
+    private final AdminClient adminClient;
+    private final Integer waitPauseTime;
+
+    /** Лок по containerId — сериализует pause/resume/stop/start/reset одного контейнера. */
+    private final Map<String, ReentrantLock> locks = new ConcurrentHashMap<>();
+    /** Семафор паузы per-containerId. */
+    private final Map<String, Semaphore> pauseSemaphores = new ConcurrentHashMap<>();
+    /** Семафор возобновления per-containerId. */
+    private final Map<String, Semaphore> resumeSemaphores = new ConcurrentHashMap<>();
+
+    public KafkaContainerAdministratorImpl(
+            KafkaListenerEndpointRegistry kafkaListenerEndpointRegistry,
+            @Qualifier("idToResetOffsetConsumerAware")
+            Map<String, AbstractResetOffsetConsumerSeekAware> idToResetOffsetConsumerAware,
+            AdminClient adminClient,
+            @Value("${application.reconciliation.wait-time-to-pause-in-sec}") Integer waitPauseTime) {
+        this.kafkaListenerEndpointRegistry = kafkaListenerEndpointRegistry;
+        this.idToResetOffsetConsumerAware = idToResetOffsetConsumerAware;
+        this.adminClient = adminClient;
+        this.waitPauseTime = waitPauseTime;
+        log.info("KafkaContainerAdministratorImpl инициализирован: зарегистрировано {} ConsumerSeekAware, таймаут ожидания паузы {} сек, таймаут блокировки {} сек",
+                idToResetOffsetConsumerAware.size(), waitPauseTime, LOCK_TIMEOUT_SEC);
+        if (log.isDebugEnabled()) {
+            log.debug("Зарегистрированные ключи ConsumerSeekAware: {}", idToResetOffsetConsumerAware.keySet());
+        }
+    }
+
+    private ReentrantLock lockFor(String containerId) {
+        return locks.computeIfAbsent(containerId, k -> {
+            log.debug("Создан новый лок для контейнера с id {}", containerId);
+            return new ReentrantLock();
+        });
+    }
+
+    private Semaphore pauseSemaphoreFor(String containerId) {
+        return pauseSemaphores.computeIfAbsent(containerId, k -> {
+            log.debug("Создан новый семафор паузы для контейнера с id {}", containerId);
+            return new Semaphore(0);
+        });
+    }
+
+    private Semaphore resumeSemaphoreFor(String containerId) {
+        return resumeSemaphores.computeIfAbsent(containerId, k -> {
+            log.debug("Создан новый семафор возобновления для контейнера с id {}", containerId);
+            return new Semaphore(0);
+        });
+    }
+
+    // -----------------------------------------------------------------
+    // PUBLIC API — управление контейнером
+    // -----------------------------------------------------------------
+
+    /** Ставит контейнер на паузу с ожиданием подтверждения. Потокобезопасно. */
+    @Override
+    public void pauseContainer(@NotNull String containerId) {
+        withLock(containerId, "постановка на паузу", () -> {
+            log.info("Постановка на паузу контейнера с id {}", containerId);
+            MessageListenerContainer listenerContainer = findContainer(containerId);
+            doPauseAndAwait(containerId, listenerContainer);
+            log.info("Контейнер с id {} успешно поставлен на паузу", containerId);
+        });
+    }
+
+    /** Возобновляет контейнер с ожиданием подтверждения. Потокобезопасно. */
+    @Override
+    public void resumeContainer(@NotNull String containerId) {
+        withLock(containerId, "возобновление", () -> {
+            log.info("Возобновление контейнера с id {}", containerId);
+            MessageListenerContainer listenerContainer = findContainer(containerId);
+            doResumeAndAwait(containerId, listenerContainer);
+            log.info("Контейнер с id {} успешно возобновлён", containerId);
+        });
+    }
+
+    /** Останавливает контейнер (выход из группы, ребаланс). Потокобезопасно. */
+    @Override
+    public void stopContainer(@NotNull String containerId) {
+        withLock(containerId, "остановка", () -> {
+            log.info("Остановка контейнера с id {}", containerId);
+            MessageListenerContainer listenerContainer = findContainer(containerId);
+            if (listenerContainer.isRunning()) {
+                log.debug("Отправка команды stop контейнеру с id {}", containerId);
+                listenerContainer.stop();
+                log.info("Контейнер с id {} остановлен", containerId);
+            } else {
+                log.info("Контейнер с id {} уже остановлен, действие не требуется", containerId);
+            }
+        });
+    }
+
+    /** Запускает контейнер (вход в группу). Потокобезопасно. */
+    @Override
+    public void startContainer(@NotNull String containerId) {
+        withLock(containerId, "запуск", () -> {
+            log.info("Запуск контейнера с id {}", containerId);
+            MessageListenerContainer listenerContainer = findContainer(containerId);
+            if (!listenerContainer.isRunning()) {
+                log.debug("Отправка команды start контейнеру с id {}", containerId);
+                listenerContainer.start();
+                log.info("Контейнер с id {} запущен", containerId);
+            } else {
+                log.info("Контейнер с id {} уже запущен, действие не требуется", containerId);
+            }
+        });
+    }
+
+    /**
+     * Сброс offset на timestamp напрямую через seekToTimestamp.
+     *
+     * ВНИМАНИЕ: двигает offset БЕЗУСЛОВНО — как назад, так и ВПЕРЁД.
+     * Проверки «только назад» здесь НЕТ. При timestamp позже текущей позиции
+     * это приведёт к ПРОПУСКУ (потере) необработанных сообщений.
+     * Для безопасного отката только назад используйте resetOffsetToPartitions
+     * вместе с calculateTargetOffsets.
+     *
+     * Метод сам ставит контейнер на паузу и возобновляет его.
+     */
+    public void resetOffsetToTimestamp(String containerId, long timestamp) {
+        withLock(containerId, "сброс offset", () -> {
+            log.info("Начало сброса offset контейнера с id {} на timestamp {}", containerId, timestamp);
+            MessageListenerContainer listenerContainer = findContainer(containerId);
+            AbstractResetOffsetConsumerSeekAware consumerSeekAware = findSeekAware(containerId);
+
+            doPauseAndAwait(containerId, listenerContainer);
+            try {
+                log.debug("Выполнение seekToTimestamp для контейнера с id {} на timestamp {}", containerId, timestamp);
+                consumerSeekAware.seekToTimestamp(timestamp);
+                log.info("Offset контейнера с id {} успешно сброшен на timestamp {}", containerId, timestamp);
+            } catch (Exception e) {
+                log.error("Ошибка сброса offset для контейнера с id {} на timestamp {}", containerId, timestamp, e);
+                throw new IllegalStateException(
+                        String.format("Ошибка сброса offset для контейнера с id %s на timestamp %d", containerId, timestamp), e);
+            } finally {
+                log.debug("Возобновление контейнера с id {} после сброса offset", containerId);
+                safeResume(containerId, listenerContainer);
+            }
+        });
+    }
+
+    /**
+     * Сброс offset контейнера на заданные значения (партиция -> offset).
+     * Сам ставит контейнер на паузу, сверяет партиции, под паузой перечитывает
+     * committed и применяет seek только «назад» (target < committed), затем
+     * возобновляет контейнер. Возобновление гарантировано даже при ошибке.
+     *
+     * Партиции в targetOffsets должны ТОЧНО совпадать с назначенными контейнеру,
+     * иначе бросается IllegalStateException (защита от рассогласования при ребалансе).
+     */
+    @Override
+    public void resetOffsetToPartitions(@NotNull String containerId, @NotNull Map<TopicPartition, Long> targetOffsets) {
+        withLock(containerId, "сброс offset по партициям", () -> {
+            log.info("Начало сброса offset контейнера с id {} по заданным партициям: {} шт.",
+                    containerId, targetOffsets == null ? 0 : targetOffsets.size());
+
+            if (CollectionUtils.isEmpty(targetOffsets)) {
+                log.warn("Пустая мапа offset для контейнера с id {}, сброс не выполняется", containerId);
+                return;
+            }
+
+            MessageListenerContainer listenerContainer = findContainer(containerId);
+            AbstractResetOffsetConsumerSeekAware consumerSeekAware = findSeekAware(containerId);
+
+            doPauseAndAwait(containerId, listenerContainer);
+            try {
+                validatePartitionsMatch(containerId, listenerContainer, targetOffsets.keySet());
+
+                // финальная перепроверка "только назад" под паузой (committed стабилен)
+                Map<TopicPartition, Long> committed = getCommittedOffsets(containerId);
+                log.debug("Контейнер с id {}: committed перед применением seek: {}", containerId, committed);
+
+                Map<TopicPartition, Long> safeToSeek = new HashMap<>();
+                targetOffsets.forEach((tp, target) -> {
+                    Long current = committed.get(tp);
+                    if (current == null) {
+                        log.info("Партиция {}: нет committed offset (новый консюмер), seek пропущен", tp);
+                    } else if (target < current) {
+                        safeToSeek.put(tp, target);
+                        log.debug("Партиция {}: target {} < committed {}, будет seek", tp, target, current);
+                    } else {
+                        log.info("Партиция {}: target {} не раньше committed {}, seek пропущен во избежание потери сообщений",
+                                tp, target, current);
+                    }
+                });
+
+                if (safeToSeek.isEmpty()) {
+                    log.info("Контейнер с id {}: после перепроверки нет партиций для seek", containerId);
+                    return;
+                }
+
+                log.debug("Контейнер с id {}: итоговые offset для seek: {}", containerId, safeToSeek);
+                safeToSeek.forEach((tp, offset) -> {
+                    log.debug("Контейнер с id {}: seek партиции {} на offset {}", containerId, tp, offset);
+                    consumerSeekAware.seekToOffset(tp.topic(), tp.partition(), offset);
+                });
+                log.info("Offset контейнера с id {} успешно сброшен для {} партиций", containerId, safeToSeek.size());
+
+            } catch (Exception e) {
+                log.error("Ошибка сброса offset по партициям для контейнера с id {}", containerId, e);
+                throw new IllegalStateException(
+                        String.format("Ошибка сброса offset по партициям для контейнера с id %s", containerId), e);
+            } finally {
+                log.debug("Возобновление контейнера с id {} после сброса offset по партициям", containerId);
+                safeResume(containerId, listenerContainer);
+            }
+        });
+    }
+
+    // -----------------------------------------------------------------
+    // Работа с offset
+    // -----------------------------------------------------------------
+
+    /**
+     * Текущие committed offset группы. Только чтение, не двигает и не паузит.
+     * Для согласованного расчёта вызывать под паузой контейнера.
+     */
+    @Override
+    public Map<TopicPartition, Long> getCommittedOffsets(@NotNull String containerId) throws Exception {
+        MessageListenerContainer listenerContainer = findContainer(containerId);
+        String groupId = listenerContainer.getGroupId();
+        log.debug("Получение committed offset для контейнера с id {}, группа {}", containerId, groupId);
+
+        Map<TopicPartition, OffsetAndMetadata> committed = adminClient
+                .listConsumerGroupOffsets(groupId)
+                .partitionsToOffsetAndMetadata()
+                .get(ADMIN_TIMEOUT_SEC, TimeUnit.SECONDS);
+
+        Map<TopicPartition, Long> result = new HashMap<>();
+        committed.forEach((tp, meta) -> {
+            if (meta != null) {
+                result.put(tp, meta.offset());
+            } else {
+                log.debug("Партиция {}: committed offset отсутствует (null)", tp);
+            }
+        });
+        log.debug("Контейнер с id {}: committed offset по партициям: {}", containerId, result);
+        return result;
+    }
+
+    /**
+     * Offset по timestamp для назначенных партиций. Если после timestamp
+     * сообщений нет (протухли/удалены retention) — берётся earliest offset.
+     * Только чтение. Вызывать под паузой для согласованности.
+     */
+    @Override
+    public Map<TopicPartition, Long> getOffsetsForTimestamp(@NotNull String containerId, long timestamp) throws Exception {
+        MessageListenerContainer listenerContainer = findContainer(containerId);
+        Collection<TopicPartition> partitions = listenerContainer.getAssignedPartitions();
+
+        if (CollectionUtils.isEmpty(partitions)) {
+            log.warn("Контейнер с id {} не имеет назначенных партиций, offset по timestamp {} не получены",
+                    containerId, timestamp);
+            return Map.of();
+        }
+        log.debug("Получение offset по timestamp {} для контейнера с id {} ({} партиций)",
+                timestamp, containerId, partitions.size());
+
+        Map<TopicPartition, OffsetSpec> query = partitions.stream()
+                .collect(Collectors.toMap(tp -> tp, tp -> OffsetSpec.forTimestamp(timestamp)));
+
+        Map<TopicPartition, ListOffsetsResult.ListOffsetsResultInfo> found =
+                adminClient.listOffsets(query).all().get(ADMIN_TIMEOUT_SEC, TimeUnit.SECONDS);
+
+        Map<TopicPartition, Long> result = new HashMap<>();
+        List<TopicPartition> needEarliest = new ArrayList<>();
+
+        found.forEach((tp, info) -> {
+            if (info.offset() != -1) {
+                result.put(tp, info.offset());
+            } else {
+                log.warn("Партиция {}: нет сообщений после timestamp {} (протухли/удалены retention), берём earliest",
+                        tp, timestamp);
+                needEarliest.add(tp);
+            }
+        });
+
+        if (!needEarliest.isEmpty()) {
+            Map<TopicPartition, OffsetSpec> earliestQuery = needEarliest.stream()
+                    .collect(Collectors.toMap(tp -> tp, tp -> OffsetSpec.earliest()));
+            adminClient.listOffsets(earliestQuery).all().get(ADMIN_TIMEOUT_SEC, TimeUnit.SECONDS)
+                    .forEach((tp, info) -> {
+                        result.put(tp, info.offset());
+                        log.info("Партиция {}: earliest offset {}", tp, info.offset());
+                    });
+        }
+
+        log.debug("Контейнер с id {}: offset по timestamp {}: {}", containerId, timestamp, result);
+        return result;
+    }
+
+    /**
+     * Из списка offset-кандидатов выбирает максимальный, НЕ превышающий committed
+     * (ближайший меньший или равный). Возвращает null, если подходящего нет
+     * (все кандидаты новее committed) или выбранный равен committed.
+     */
+    private Long chooseNearestBackwardOffset(List<Long> candidates, long committedOffset) {
+        Long chosen = candidates.stream()
+                .filter(offset -> offset <= committedOffset)
+                .max(Long::compareTo)
+                .orElse(null);
+
+        if (chosen == null || chosen == committedOffset) {
+            return null;
+        }
+        return chosen;
+    }
+
+    /**
+     * Рассчитывает целевые offset по списку таймштампов (ближайший меньший или
+     * равный committed для каждой партиции). ТОЛЬКО читает метаданные, ничего
+     * не двигает и НЕ ставит паузу.
+     *
+     * ВАЖНО: между расчётом и применением (resetOffsetToPartitions) committed
+     * может измениться, если контейнер не на паузе. Для согласованности
+     * вызывающий код должен поставить контейнер на паузу ДО расчёта и держать
+     * её до применения seek.
+     *
+     * Поведение при отсутствии committed: если группа активна и в партиции есть
+     * данные — вероятно протухание offset (ERROR в лог). Иначе — новый консюмер
+     * (INFO), партиция пропускается.
+     */
+    @Override
+    public Map<TopicPartition, Long> calculateTargetOffsets(@NotNull String containerId, @NotNull List<Long> timestamps)
+            throws Exception {
+        if (CollectionUtils.isEmpty(timestamps)) {
+            log.warn("Список таймштампов пуст для контейнера с id {}, целевые offset не рассчитаны", containerId);
+            return Map.of();
+        }
+        log.debug("Расчёт целевого offset для контейнера с id {} по {} таймштампам", containerId, timestamps.size());
+
+        Map<TopicPartition, Long> committed = getCommittedOffsets(containerId);
+
+        // группа активна? (для отличия "протухло" от "новый консюмер")
+        boolean groupActive = isGroupActiveSafe(containerId);
+
+        Map<TopicPartition, List<Long>> candidatesByPartition = new HashMap<>();
+        for (Long timestamp : timestamps) {
+            Map<TopicPartition, Long> perTs = getOffsetsForTimestamp(containerId, timestamp);
+            perTs.forEach((tp, offset) ->
+                    candidatesByPartition.computeIfAbsent(tp, k -> new ArrayList<>()).add(offset));
+        }
+
+        if (log.isDebugEnabled()) {
+            candidatesByPartition.forEach((tp, cand) ->
+                    log.debug("Контейнер с id {}: партиция {} кандидаты-offset по таймштампам: {}", containerId, tp, cand));
+        }
+
+        Map<TopicPartition, Long> result = new HashMap<>();
+        candidatesByPartition.forEach((tp, candidates) -> {
+            Long committedOffset = committed.get(tp);
+            if (committedOffset == null) {
+                // отличаем протухание от нового консюмера
+                if (groupActive) {
+                    log.error("Партиция {}: committed offset отсутствует при активной группе — вероятно, offset протух "
+                            + "по offsets.retention. Проверьте retention и периодичность reconciliation. Партиция пропущена", tp);
+                } else {
+                    log.info("Партиция {}: нет committed offset (новый консюмер / неактивная группа), offset не сбрасывается", tp);
+                }
+                return;
+            }
+            Long chosen = chooseNearestBackwardOffset(candidates, committedOffset);
+            if (chosen == null) {
+                // все кандидаты новее committed — остаёмся на committed, откат не требуется
+                log.info("Партиция {}: все кандидаты новее committed {}, остаёмся на committed, откат не требуется",
+                        tp, committedOffset);
+            } else {
+                result.put(tp, chosen);
+                log.info("Партиция {}: выбран целевой offset {} (committed {}, кандидатов {})",
+                        tp, chosen, committedOffset, candidates.size());
+            }
+        });
+
+        log.debug("Контейнер с id {}: итоговые целевые offset для seek: {}", containerId, result);
+        return result;
+    }
+
+    /**
+     * Проверяет, активна ли группа (STABLE с членами). Используется, чтобы
+     * отличить протухание committed offset от нового консюмера.
+     * При ошибке проверки возвращает false (не паникуем).
+     */
+    private boolean isGroupActiveSafe(String containerId) {
+        try {
+            MessageListenerContainer container = findContainer(containerId);
+            String groupId = container.getGroupId();
+            ConsumerGroupDescription desc = adminClient.describeConsumerGroups(List.of(groupId))
+                    .describedGroups().get(groupId).get(ADMIN_TIMEOUT_SEC, TimeUnit.SECONDS);
+            boolean active = desc.state() == ConsumerGroupState.STABLE && !desc.members().isEmpty();
+            log.debug("Контейнер с id {}: группа {} активна={} (состояние {})",
+                    containerId, groupId, active, desc.state());
+            return active;
+        } catch (Exception e) {
+            log.warn("Не удалось определить состояние группы для контейнера с id {}: {}", containerId, e.getMessage());
+            return false;
+        }
+    }
